@@ -633,6 +633,14 @@ fetch_pull_operation::fetch_pull_operation(mode_type mode,
                 "set custom handlers for SIGINT and SIGTERM signals");
     const volatile std::atomic_flag &termination_flag{global_termination_flag};
 
+    const auto &keyring_config = config.root().get<"keyring">();
+    if (keyring_config.has_value()) {
+      log_keyring_config_info(*logger, *keyring_config);
+    } else {
+      logger->log(binsrv::log_severity::info,
+                  "keyring configuration options are not specified");
+    }
+
     const auto &storage_config = config.root().get<"storage">();
     log_storage_config_info(*logger, storage_config);
 
@@ -648,7 +656,7 @@ fetch_pull_operation::fetch_pull_operation(mode_type mode,
     const auto replication_mode{replication_config.get<"mode">()};
     const auto optional_rewrite_config{replication_config.get<"rewrite">()};
 
-    binsrv::storage storage{storage_config,
+    binsrv::storage storage{logger, keyring_config, storage_config,
                             binsrv::storage_construction_mode_type::streaming,
                             replication_mode};
     log_storage_info(*logger, storage);

@@ -29,4 +29,11 @@ namespace binsrv {
   return masked_uri.c_str();
 }
 
+void storage_config::validate() const {
+  const auto &optional_encryption{get<"encryption">()};
+  if (optional_encryption.has_value()) {
+    optional_encryption->validate();
+  }
+}
+
 } // namespace binsrv

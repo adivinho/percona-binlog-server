@@ -50,11 +50,14 @@ generic_operation<mode_type::purge_binlogs>::execute() const {
         binsrv::events::composite_binlog_name::parse(get_binlog_name())};
 
     const binsrv::main_config config{get_config_file_path()};
+    const auto &keyring_config = config.root().get<"keyring">();
     const auto &storage_config = config.root().get<"storage">();
     const auto &replication_config = config.root().get<"replication">();
     const auto replication_mode{replication_config.get<"mode">()};
 
-    binsrv::storage storage{storage_config,
+    binsrv::storage storage{{},
+                            keyring_config,
+                            storage_config,
                             binsrv::storage_construction_mode_type::purging,
                             replication_mode};
 

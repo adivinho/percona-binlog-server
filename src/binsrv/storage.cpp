@@ -23,6 +23,7 @@
 #include <exception>
 #include <filesystem>
 #include <iterator>
+#include <optional>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -30,8 +31,15 @@
 #include <utility>
 #include <vector>
 
+#include "binsrv/basic_keyring.hpp"
+#include "binsrv/basic_logger.hpp"
 #include "binsrv/basic_storage_backend.hpp"
 #include "binsrv/binlog_file_metadata.hpp"
+#include "binsrv/encryption_format_type.hpp"
+#include "binsrv/keyring_config.hpp"
+#include "binsrv/keyring_factory.hpp"
+#include "binsrv/keyring_record.hpp"
+#include "binsrv/log_severity.hpp"
 #include "binsrv/replication_mode_type.hpp"
 #include "binsrv/storage_backend_factory.hpp"
 #include "binsrv/storage_config.hpp"
@@ -44,17 +52,83 @@
 #include "binsrv/gtids/gtid.hpp"
 #include "binsrv/gtids/gtid_set.hpp"
 
+#include "binsrv/models/binlog_file_encryption_record.hpp"
+
+#include "opensslpp/cipher_context.hpp"
+#include "opensslpp/crypto_rng.hpp"
+
 #include "util/byte_span.hpp"
 #include "util/ctime_timestamp.hpp"
 #include "util/exception_location_helpers.hpp"
 
 namespace binsrv {
 
-storage::storage(const storage_config &config,
+[[nodiscard]] models::binlog_file_encryption_record
+storage::binlog_encryption_record::to_model(
+    const storage::binlog_encryption_record &record) {
+  models::binlog_file_encryption_record model{};
+
+  auto &file_key_envelope{model.get<"file_key_envelope">()};
+  file_key_envelope.get<"kek_id">() = record.kek_id;
+  file_key_envelope.get<"data_hex">() = record.file_key_encrypted_with_kek;
+  if (record.iv_for_file_key_encryption.has_value()) {
+    file_key_envelope.get<"iv_hex">() = *record.iv_for_file_key_encryption;
+  }
+  if (record.tag_of_file_key_encryption.has_value()) {
+    file_key_envelope.get<"tag_hex">() = *record.tag_of_file_key_encryption;
+  }
+
+  auto &file_data_envelope{model.get<"file_data_envelope">()};
+  file_data_envelope.get<"cipher">() = record.data_cipher;
+  file_data_envelope.get<"iv_hex">() = record.iv_for_data_encryption;
+  if (record.tag_of_data_encryption.has_value()) {
+    file_data_envelope.get<"tag_hex">() = *record.tag_of_data_encryption;
+  }
+  return model;
+}
+
+[[nodiscard]] storage::binlog_encryption_record
+storage::binlog_encryption_record::from_model(
+    const models::binlog_file_encryption_record &model) {
+  binlog_encryption_record record{};
+
+  const auto &file_key_envelope{model.get<"file_key_envelope">()};
+  record.kek_id = file_key_envelope.get<"kek_id">();
+  const auto file_key_raw{file_key_envelope.get<"data_hex">().get_data()};
+  record.file_key_encrypted_with_kek.assign(std::cbegin(file_key_raw),
+                                            std::cend(file_key_raw));
+  if (file_key_envelope.get<"iv_hex">().has_value()) {
+    const auto file_key_iv_raw{file_key_envelope.get<"iv_hex">()->get_data()};
+    record.iv_for_file_key_encryption.emplace(std::cbegin(file_key_iv_raw),
+                                              std::cend(file_key_iv_raw));
+  }
+  if (file_key_envelope.get<"tag_hex">().has_value()) {
+    const auto file_key_tag_raw{file_key_envelope.get<"tag_hex">()->get_data()};
+    record.tag_of_file_key_encryption.emplace(std::cbegin(file_key_tag_raw),
+                                              std::cend(file_key_tag_raw));
+  }
+
+  const auto &file_data_envelope{model.get<"file_data_envelope">()};
+  record.data_cipher = file_data_envelope.get<"cipher">();
+  const auto file_data_iv_raw{file_data_envelope.get<"iv_hex">().get_data()};
+  record.iv_for_data_encryption.assign(std::cbegin(file_data_iv_raw),
+                                       std::cend(file_data_iv_raw));
+  if (file_data_envelope.get<"tag_hex">().has_value()) {
+    const auto file_data_tag_raw{
+        file_data_envelope.get<"tag_hex">()->get_data()};
+    record.tag_of_data_encryption.emplace(std::cbegin(file_data_tag_raw),
+                                          std::cend(file_data_tag_raw));
+  }
+  return record;
+}
+
+storage::storage(basic_logger_ptr logger,
+                 const optional_keyring_config &keyring_config,
+                 const storage_config &config,
                  storage_construction_mode_type construction_mode,
                  replication_mode_type replication_mode)
-    : construction_mode_{construction_mode}, backend_{},
-      replication_mode_{replication_mode} {
+    : logger_{std::move(logger)}, construction_mode_{construction_mode},
+      backend_{}, replication_mode_{replication_mode} {
   const auto &checkpoint_size_opt{config.get<"checkpoint_size">()};
   if (checkpoint_size_opt.has_value()) {
     checkpoint_size_bytes_ = checkpoint_size_opt->get_value();
@@ -66,9 +140,17 @@ storage::storage(const storage_config &config,
         std::chrono::seconds{checkpoint_interval_opt->get_value()};
   }
 
+  if (keyring_config.has_value()) {
+    keyring_ = keyring_factory::create(keyring_config->get<"uri">());
+  }
+  const auto &encryption_config{config.get<"encryption">()};
+  initialize_storage_encryption(encryption_config);
+
   backend_ = storage_backend_factory::create(config);
 
   auto storage_objects{backend_->list_objects()};
+  remove_temporary_objects(storage_objects);
+
   if (storage_objects.empty()) {
     // initialized on a new / empty storage - just save metadata and return
     if (construction_mode_ == storage_construction_mode_type::streaming) {
@@ -84,10 +166,20 @@ storage::storage(const storage_config &config,
   }
   storage_objects.erase(metadata_it);
 
+  // as load_metadata() will be updating 'encryption_format_', saving it here
+  // to use for validation later
+  const auto encryption_format{encryption_format_};
   load_metadata();
-  validate_metadata(replication_mode);
+  validate_metadata(replication_mode, encryption_format);
+  // in case when storage metadata file is present and did not have encryption
+  // format specified, but it is set in the configuration file, we need to
+  // update storage metadata
+  if (!encryption_format_.has_value() && encryption_format.has_value()) {
+    encryption_format_ = encryption_format;
+    save_metadata();
+  }
 
-  // if after metadata erasure 'storage_objects' is empty, then this mean
+  // if after metadata erasure 'storage_objects' is empty, then this means
   // that it has only metadata in it that passes validation and we can
   // consider it as an initialized empty storage, so just return
   if (storage_objects.empty()) {
@@ -406,6 +498,95 @@ storage::purge_binlogs(const events::composite_binlog_name &target) {
   return backend_->get_object_uri(binlog_name.str());
 }
 
+[[nodiscard]] std::string storage::get_keyring_description() const {
+  return is_keyring_initialized() ? keyring_->get_description()
+                                  : "keyring is not initialized";
+}
+
+[[nodiscard]] std::string storage::get_active_kek_description() const {
+  return has_active_kek() ? keyring_->get_key(active_kek_id_).get_description()
+                          : "active KEK is not set";
+}
+
+[[nodiscard]] std::string storage::get_encryption_format_description() const {
+  return encryption_format_.has_value()
+             ? std::string{to_string_view(*encryption_format_)}
+             : std::string{"encryption format is not set"};
+}
+
+void storage::log(log_severity level, std::string_view message) const {
+  if (logger_) {
+    logger_->log(level, message);
+  }
+}
+
+void storage::remove_temporary_objects(
+    storage_object_name_container &object_names) {
+  using remove_object_container = std::vector<std::string>;
+  remove_object_container remove_objects;
+  for (auto it{std::begin(object_names)}; it != std::end(object_names);) {
+    const std::filesystem::path object_name{it->first};
+    if (object_name.has_extension() &&
+        object_name.extension() == tmp_storage_object_suffix) {
+      auto object_node = object_names.extract(it++);
+      remove_objects.emplace_back(std::move(object_node.key()));
+      log(log_severity::warning, "found temporary storage object '" +
+                                     object_name.string() +
+                                     "' left after improper shutdown");
+    } else {
+      ++it;
+    }
+  }
+  if (remove_objects.empty()) {
+    return;
+  }
+
+  // for querying-only mode we do not perform any modifying operations - just
+  // clear the 'object_names' container and return
+  if (construction_mode_ == storage_construction_mode_type::querying_only) {
+    return;
+  }
+
+  backend_->remove_objects(remove_objects);
+  log(log_severity::warning,
+      "removed " + std::to_string(remove_objects.size()) +
+          " temporary storage object(s) left after improper shutdown");
+}
+
+void storage::initialize_storage_encryption(
+    const optional_encryption_config &encryption_config) {
+  if (encryption_config.has_value()) {
+    encryption_format_ = encryption_config->get<"format">();
+    if (!is_keyring_initialized()) {
+      util::exception_location().raise<std::logic_error>(
+          "encryption is enabled but keyring is not initialized");
+    }
+    const auto &kek_id{encryption_config->get<"kek_id">()};
+    if (!keyring_->contains(kek_id)) {
+      util::exception_location().raise<std::runtime_error>(
+          "keyring does not contain the specified KEK ID");
+    }
+    active_kek_id_ = kek_id;
+    active_data_cipher_ = encryption_config->get<"cipher">();
+
+    // make sure that random file keys (of length that corresponds to the
+    // active data cipher) can be encrypted with the active KEK -
+    // for instance, if active data cipher is AES-192-CRT (key length 24
+    // bytes), then the active KEK cannot be of ECB or CBC mode as these
+    // ciphers can only encrypt data of length that is a multiple of the
+    // block size (16 bytes)
+    const auto &keyring_record{keyring_->get_key(active_kek_id_)};
+    if (opensslpp::cipher_context::get_key_size_in_bytes(active_data_cipher_) %
+            opensslpp::cipher_context::get_block_size_in_bytes(
+                keyring_record.get<"cipher">()) !=
+        0U) {
+      util::exception_location().raise<std::runtime_error>(
+          "active data cipher key length is not compatible with the active "
+          "KEK cipher block size");
+    }
+  }
+}
+
 void storage::ensure_streaming_mode() const {
   if (construction_mode_ != storage_construction_mode_type::streaming) {
     util::exception_location().raise<std::logic_error>(
@@ -431,9 +612,11 @@ void storage::update_last_checkpoint_info() {
 
 [[nodiscard]] open_binlog_status storage::open_new_binlog_file_internal(
     const events::composite_binlog_name &binlog_name) {
+
+  auto encryption_record{generate_binlog_encryption_record()};
   // writing the magic binlog footprint only if this is a newly
   // created file
-  backend_->write_data_to_stream(events::magic_binlog_payload);
+  write_data_to_stream(events::magic_binlog_payload, encryption_record, 0ULL);
 
   gtids::optional_gtid_set previous_binlog_gtids{};
   gtids::optional_gtid_set added_binlog_gtids{};
@@ -442,10 +625,11 @@ void storage::update_last_checkpoint_info() {
     added_binlog_gtids = gtids::gtid_set{};
   }
 
-  binlog_records_.emplace_back(binlog_name, events::magic_binlog_offset,
-                               std::move(previous_binlog_gtids),
-                               std::move(added_binlog_gtids),
-                               util::ctime_timestamp_range{});
+  binlog_records_.emplace_back(
+      binlog_name, events::magic_binlog_offset,
+      std::move(previous_binlog_gtids), std::move(added_binlog_gtids),
+      util::ctime_timestamp_range{}, events::seq_no_t{},
+      std::move(encryption_record));
   save_binlog_metadata(get_current_binlog_record());
   save_binlog_index();
   return open_binlog_status::created;
@@ -459,7 +643,9 @@ storage::open_existing_binlog_file_internal(std::uint64_t open_stream_offset) {
                : open_binlog_status::opened_with_data_present;
   }
   assert(open_stream_offset == 0ULL);
-  backend_->write_data_to_stream(events::magic_binlog_payload);
+
+  write_data_to_stream(events::magic_binlog_payload,
+                       get_current_binlog_record().encryption, 0ULL);
   get_current_binlog_record().size = events::magic_binlog_offset;
   return open_binlog_status::opened_empty;
 }
@@ -474,7 +660,9 @@ void storage::flush_event_buffer_internal() {
       last_transaction_boundary_position_in_event_buffer_};
   // writing <last_transaction_boundary_position_in_event_buffer_> bytes from
   // the beginning of the event buffer
-  backend_->write_data_to_stream(transactions_data);
+  write_data_to_stream(transactions_data,
+                       get_current_binlog_record().encryption,
+                       get_current_binlog_record().size);
   get_current_binlog_record().size +=
       last_transaction_boundary_position_in_event_buffer_;
   if (is_in_gtid_replication_mode()) {
@@ -584,19 +772,33 @@ void storage::load_metadata() {
   const auto metadata_content{backend_->get_object(metadata_name)};
   const storage_metadata metadata{metadata_content};
   replication_mode_ = metadata.root().get<"mode">();
+  encryption_format_ = metadata.root().get<"encryption">();
 }
 
-void storage::validate_metadata(replication_mode_type replication_mode) const {
+void storage::validate_metadata(
+    replication_mode_type replication_mode,
+    const optional_encryption_format_type &encryption_format) const {
   if (replication_mode != replication_mode_) {
     util::exception_location().raise<std::logic_error>(
         "replication mode provided to initialize storage differs from the one "
         "stored in metadata");
+  }
+
+  if (encryption_format_.has_value() && encryption_format.has_value() &&
+      *encryption_format_ != *encryption_format) {
+    // if both encryption formats (the existing one loaded from the storage
+    // metadata file and a new one specified in the configuration file) are
+    // present and have different values, then this is an error
+    util::exception_location().raise<std::logic_error>(
+        "storage encryption format provided to initialize storage differs from "
+        "the one stored in metadata");
   }
 }
 
 void storage::save_metadata() const {
   storage_metadata metadata{};
   metadata.root().get<"mode">() = replication_mode_;
+  metadata.root().get<"encryption">() = encryption_format_;
   const auto content{metadata.str()};
   backend_->put_object(metadata_name, util::as_const_byte_span(content));
 }
@@ -614,6 +816,7 @@ void storage::save_metadata() const {
       backend_->get_object(generate_binlog_metadata_name(binlog_name))};
   binlog_file_metadata metadata{content};
 
+  const auto &optional_encryption_metadata{metadata.root().get<"encryption">()};
   return binlog_record{
       .name = binlog_name,
       .size = metadata.root().get<"size">(),
@@ -621,7 +824,11 @@ void storage::save_metadata() const {
       .added_gtids = metadata.root().get<"added_gtids">(),
       .timestamps = {metadata.root().get<"min_timestamp">(),
                      metadata.root().get<"max_timestamp">()},
-      .last_sequence_number = metadata.root().get<"last_sequence_number">()};
+      .last_sequence_number = metadata.root().get<"last_sequence_number">(),
+      .encryption = optional_encryption_metadata.has_value()
+                        ? binlog_encryption_record::from_model(
+                              *optional_encryption_metadata)
+                        : optional_binlog_encryption_record{}};
 }
 
 void storage::validate_binlog_metadata(const binlog_record &record) const {
@@ -650,6 +857,21 @@ void storage::validate_binlog_metadata(const binlog_record &record) const {
           "replication mode");
     }
   }
+  // make sure that if the encryption record is present in the binlog
+  // metadata, keyring must be initialized and contain the KEK with the
+  // ID specified in the encryption record
+  if (record.encryption.has_value()) {
+    if (!is_keyring_initialized()) {
+      util::exception_location().raise<std::logic_error>(
+          "found encryption record in the binlog metadata but keyring is not "
+          "initialized");
+    }
+    if (!keyring_->contains(record.encryption->kek_id)) {
+      util::exception_location().raise<std::logic_error>(
+          "found encryption record in the binlog metadata but keyring does not "
+          "contain the specified KEK ID");
+    }
+  }
 }
 
 void storage::save_binlog_metadata(const binlog_record &record) const {
@@ -662,6 +884,11 @@ void storage::save_binlog_metadata(const binlog_record &record) const {
   metadata.root().get<"max_timestamp">() =
       util::ctime_timestamp{record.timestamps.get_max_timestamp()};
   metadata.root().get<"last_sequence_number">() = record.last_sequence_number;
+  const auto &record_encryption{record.encryption};
+  if (record_encryption.has_value()) {
+    metadata.root().get<"encryption">() =
+        binlog_encryption_record::to_model(*record_encryption);
+  }
   const auto content{metadata.str()};
   backend_->put_object(generate_binlog_metadata_name(record.name),
                        util::as_const_byte_span(content));
@@ -697,12 +924,32 @@ void storage::load_and_validate_binlog_metadata_set(
     // validating binlog size from the metadata only makes sense if we are not
     // in the querying_only mode
     if (construction_mode_ != storage_construction_mode_type::querying_only) {
+      const auto binlog_file_name{record_it->name.str()};
+      const auto actual_binlog_file_size{object_names.at(binlog_file_name)};
       // validating that the size stored in the metadata matches the actual size
-      if (loaded_binlog_metadata.size !=
-          object_names.at(record_it->name.str())) {
-        util::exception_location().raise<std::logic_error>(
-            "size from the binlog metadata does not match the actual binlog "
-            "size");
+      if (loaded_binlog_metadata.size != actual_binlog_file_size) {
+        // in case when Binlog Server process was not properly shut down
+        // there is a chance that there will be mismatch between the actual
+        // binlog data file size and the 'size' field in the binlog metadata
+
+        // if this mismatch was found in the most recent binlog file, we can
+        // perform automatic recovery (truncating binlog data file content to
+        // the size from the metadata)
+        if (std::next(record_it) != std::end(binlog_records_)) {
+          util::exception_location().raise<std::logic_error>(
+              "size from the binlog metadata does not match the actual binlog "
+              "size");
+        }
+        // performing recovery
+        if (loaded_binlog_metadata.size > actual_binlog_file_size) {
+          util::exception_location().raise<std::logic_error>(
+              "cannot perform recovery - size from the binlog metadata is "
+              "bigger than the actual binlog file size");
+        }
+        backend_->resize_object(binlog_file_name, loaded_binlog_metadata.size);
+        log(log_severity::warning,
+            "recovered binlog file '" + binlog_file_name +
+                "' by truncating it to the size from the metadata");
       }
     }
     *record_it = std::move(loaded_binlog_metadata);
@@ -724,6 +971,157 @@ void storage::load_and_validate_binlog_metadata_set(
   if (optional_added_gtids.has_value()) {
     purged_gtids_ = *optional_added_gtids;
   }
+}
+
+[[nodiscard]] storage::optional_binlog_encryption_record
+storage::generate_binlog_encryption_record() const {
+  if (!has_active_kek()) {
+    return std::nullopt;
+  }
+
+  // we identify the KEK record in the keyring by the active KEK ID,
+  // specified in the main configuration file
+  // ('<storage.encryption.kek_id>' parameter)
+  const auto &keyring_record{keyring_->get_key(active_kek_id_)};
+
+  // identifying the the cipher name and the key data from the
+  // keyring record - this data will be used to encrypt random file
+  // keys generated for new binlog data files
+  const auto &kek_cipher{keyring_record.get<"cipher">()};
+  const auto &kek{keyring_record.get<"data_hex">().get_data()};
+
+  // identify the size of the IV that will be used for file key
+  // encryption based on the KEK cipher; if the KEK cipher is in ECB mode, then
+  // the IV is not used and its size will be 0
+  const auto iv_size_for_file_key_encryption{
+      opensslpp::cipher_context::get_iv_size_in_bytes(kek_cipher)};
+  util::optional_hex_value_storage iv_for_file_key_encryption{};
+  util::const_byte_span iv_for_file_key_encryption_v{};
+  if (iv_size_for_file_key_encryption != 0U) {
+    // generating random IV for file key encryption
+    iv_for_file_key_encryption.emplace(iv_size_for_file_key_encryption);
+    opensslpp::crypto_rng::generate(*iv_for_file_key_encryption);
+    iv_for_file_key_encryption_v = *iv_for_file_key_encryption;
+  }
+
+  // identify the size of the file key based on the active data cipher
+  const auto file_key_size{
+      opensslpp::cipher_context::get_key_size_in_bytes(active_data_cipher_)};
+
+  // generating random file key
+  util::hex_value_storage file_key{file_key_size};
+  opensslpp::crypto_rng::generate(file_key);
+
+  // creating an encryption context with the KEK cipher, the KEK, and
+  // the IV for file key encryption
+  opensslpp::cipher_context file_key_encryption_context{
+      opensslpp::cipher_context_operation_type::encryption, kek_cipher, kek,
+      iv_for_file_key_encryption_v};
+
+  // identify the size of the file key encryption tag from the encryption
+  // (should be non-zero only for GCM modes)
+  const auto file_key_encryption_tag_size{
+      file_key_encryption_context.get_tag_size_in_bytes()};
+  // provisioning the optional storage for the file key encryption tag
+  util::optional_hex_value_storage tag_of_file_key_encryption{};
+  util::byte_span tag_of_file_key_encryption_v{};
+  if (file_key_encryption_tag_size != 0U) {
+    tag_of_file_key_encryption.emplace(file_key_encryption_tag_size);
+    tag_of_file_key_encryption_v = *tag_of_file_key_encryption;
+  }
+
+  // performing the file key encryption and finalizing the tag (if any)
+  util::hex_value_storage file_key_encrypted_with_kek{file_key_size};
+  file_key_encryption_context.update(file_key, file_key_encrypted_with_kek);
+  file_key_encryption_context.finalize(tag_of_file_key_encryption_v);
+
+  // identifying the size of the IV that will be used for data encryption based
+  // on the active data cipher
+  const auto iv_length_for_data_encryption{
+      opensslpp::cipher_context::get_iv_size_in_bytes(active_data_cipher_)};
+  // generating random IV for file data encryption
+  util::hex_value_storage iv_for_data_encryption{iv_length_for_data_encryption};
+  opensslpp::crypto_rng::generate(iv_for_data_encryption);
+
+  // the tag of data encryption will be generated during the actual data
+  // encryption
+  binlog_encryption_record encryption_record{
+      .kek_id = active_kek_id_,
+      .file_key_encrypted_with_kek = file_key_encrypted_with_kek,
+      .iv_for_file_key_encryption = iv_for_file_key_encryption,
+      .tag_of_file_key_encryption = tag_of_file_key_encryption,
+      .data_cipher = active_data_cipher_,
+      .iv_for_data_encryption = iv_for_data_encryption,
+      .tag_of_data_encryption = {}};
+
+  return encryption_record;
+}
+
+void storage::write_data_to_stream(
+    util::const_byte_span data,
+    const optional_binlog_encryption_record &encryption_record,
+    std::uint64_t offset) {
+  if (!encryption_record.has_value()) {
+    // an early return when no encryption is needed
+    backend_->write_data_to_stream(data);
+    return;
+  }
+
+  // as for security reasons our intent is to not store file keys in plaintext
+  // permanently, we need to decrypt the file key with the KEK before we can
+  // use it for data encryption.
+
+  const auto &keyring_record{keyring_->get_key(encryption_record->kek_id)};
+
+  const auto &kek_cipher{keyring_record.get<"cipher">()};
+  const auto &kek{keyring_record.get<"data_hex">().get_data()};
+
+  util::const_byte_span iv_for_file_key_encryption_v{};
+  if (encryption_record->iv_for_file_key_encryption.has_value()) {
+    iv_for_file_key_encryption_v =
+        *encryption_record->iv_for_file_key_encryption;
+  };
+  util::const_byte_span tag_of_file_key_encryption_v{};
+  if (encryption_record->tag_of_file_key_encryption.has_value()) {
+    tag_of_file_key_encryption_v =
+        *encryption_record->tag_of_file_key_encryption;
+  }
+
+  // creating a context for the file key decryption
+  opensslpp::cipher_context file_key_decryption_context{
+      opensslpp::cipher_context_operation_type::decryption, kek_cipher, kek,
+      iv_for_file_key_encryption_v, tag_of_file_key_encryption_v};
+  util::hex_value_storage file_key_decrypted{
+      std::size(encryption_record->file_key_encrypted_with_kek)};
+  file_key_decryption_context.update(
+      encryption_record->file_key_encrypted_with_kek, file_key_decrypted);
+  file_key_decryption_context.finalize();
+
+  // creating an context for data encryption with the data cipher, the file
+  // key (decrypted previously), and the IV for data encryption
+
+  auto data_encryption_context{opensslpp::cipher_context::create_with_offset(
+      offset, opensslpp::cipher_context_operation_type::encryption,
+      encryption_record->data_cipher, file_key_decrypted,
+      encryption_record->iv_for_data_encryption)};
+
+  util::optional_hex_value_storage tag_of_data_encryption{};
+  util::byte_span tag_of_data_encryption_v{};
+  const auto data_encryption_tag_size{
+      data_encryption_context.get_tag_size_in_bytes()};
+  if (data_encryption_tag_size != 0U) {
+    tag_of_data_encryption.emplace(data_encryption_tag_size);
+    tag_of_data_encryption_v = *tag_of_data_encryption;
+  }
+
+  util::hex_value_storage encrypted_data{std::size(data)};
+  data_encryption_context.update(data, encrypted_data);
+  data_encryption_context.finalize(tag_of_data_encryption_v);
+
+  backend_->write_data_to_stream(encrypted_data);
+
+  // TODO: update file data encryption tag here, if one day we decide to
+  //       support GCM mode for file data encryption
 }
 
 } // namespace binsrv

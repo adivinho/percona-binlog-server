@@ -26,6 +26,8 @@
 
 #include "binsrv/gtids/gtid_set.hpp"
 
+#include "binsrv/models/binlog_file_encryption_record.hpp" // IWYU pragma: export
+
 #include "util/ctime_timestamp.hpp"
 #include "util/nv_tuple.hpp"
 
@@ -47,7 +49,8 @@ private:
       util::nv<"added_gtids", gtids::optional_gtid_set>,
       util::nv<"min_timestamp", util::ctime_timestamp>,
       util::nv<"max_timestamp", util::ctime_timestamp>,
-      util::nv<"last_sequence_number", events::seq_no_t>
+      util::nv<"last_sequence_number", events::seq_no_t>,
+      util::nv<"encryption", models::optional_binlog_file_encryption_record>
       // clang-format on
       >;
 

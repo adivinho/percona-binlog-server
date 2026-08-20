@@ -43,12 +43,16 @@ generic_operation<mode_type::list>::generic_operation(
 
   try {
     const binsrv::main_config config{get_config_file_path()};
+    const auto &keyring_config = config.root().get<"keyring">();
     const auto &storage_config = config.root().get<"storage">();
     const auto &replication_config = config.root().get<"replication">();
     const auto replication_mode{replication_config.get<"mode">()};
 
     const binsrv::storage storage{
-        storage_config, binsrv::storage_construction_mode_type::querying_only,
+        {},
+        keyring_config,
+        storage_config,
+        binsrv::storage_construction_mode_type::querying_only,
         replication_mode};
 
     binsrv::models::search_response response;

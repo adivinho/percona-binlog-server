@@ -19,6 +19,8 @@
 #include <cstdint>
 
 #include "binsrv/basic_logger_fwd.hpp"
+#include "binsrv/encryption_config_fwd.hpp"
+#include "binsrv/keyring_config_fwd.hpp"
 #include "binsrv/replication_config_fwd.hpp"
 #include "binsrv/rewrite_config_fwd.hpp"
 #include "binsrv/storage_config_fwd.hpp"
@@ -47,6 +49,13 @@ void log_rewrite_config_info(binsrv::basic_logger &logger,
 void log_replication_config_info(
     binsrv::basic_logger &logger,
     const binsrv::replication_config &replication_config);
+
+void log_keyring_config_info(binsrv::basic_logger &logger,
+                             const binsrv::keyring_config &keyring_config);
+
+void log_encryption_config_info(
+    binsrv::basic_logger &logger,
+    const binsrv::encryption_config &encryption_config);
 
 void log_storage_config_info(binsrv::basic_logger &logger,
                              const binsrv::storage_config &storage_config);

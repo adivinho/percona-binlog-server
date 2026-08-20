@@ -134,6 +134,12 @@ install -D -m 0644  main_config.json %{buildroot}/%{_sysconfdir}/percona-binlog-
 
 
 %changelog
+* Wed Aug 19 2026 Yura Sorokin <yura.sorokin@percona.com> - 0.4.1-1
+- PBS-21 Implement fixing recovery logic during storage initialization.
+
+* Wed Aug 12 2026 Yura Sorokin <yura.sorokin@percona.com> - 0.4.0-1
+- PBS-39 Add binlog encryption.
+
 * Thu Jun 11 2026 Yura Sorokin <yura.sorokin@percona.com> - 0.3.1-1
 - PBS-27 binlog_server list command fails with ERROR if executed while fetch/pull is in progress.
 

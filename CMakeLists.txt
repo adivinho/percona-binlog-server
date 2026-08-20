@@ -118,6 +118,13 @@ set(util_source_files
 
   src/util/exception_location_helpers.hpp
 
+  src/util/file_operations_helpers.hpp
+  src/util/file_operations_helpers.cpp
+
+  src/util/hex_value_fwd.hpp
+  src/util/hex_value.hpp
+  src/util/hex_value.cpp
+
   src/util/flag_set_fwd.hpp
   src/util/flag_set.hpp
 
@@ -159,6 +166,36 @@ set_target_properties(lib_util PROPERTIES
   CXX_EXTENSIONS NO
 )
 add_library(binsrv::lib_util ALIAS lib_util)
+
+# OpenSSL++ files
+set(opensslpp_source_files
+  src/opensslpp/cipher_mode_type_fwd.hpp
+  src/opensslpp/cipher_mode_type.hpp
+
+  src/opensslpp/cipher_context_fwd.hpp
+  src/opensslpp/cipher_context.hpp
+  src/opensslpp/cipher_context.cpp
+
+  src/opensslpp/crypto_rng.hpp
+  src/opensslpp/crypto_rng.cpp
+
+  src/opensslpp/core_error_fwd.hpp
+  src/opensslpp/core_error.hpp
+  src/opensslpp/core_error.cpp
+)
+add_library(lib_opensslpp STATIC ${opensslpp_source_files})
+target_link_libraries(lib_opensslpp
+  PRIVATE
+    binlog_server_compiler_flags
+    Boost::headers OpenSSL::Crypto
+)
+# it is not possible to propagate CXX_EXTENSIONS and CXX_STANDARD_REQUIRED
+# via interface library (binlog_server_compiler_flags)
+set_target_properties(lib_opensslpp PROPERTIES
+  CXX_STANDARD_REQUIRED YES
+  CXX_EXTENSIONS NO
+)
+add_library(binsrv::lib_opensslpp ALIAS lib_opensslpp)
 
 # mysql wrapper library files
 set(easymysql_source_files
@@ -397,9 +434,18 @@ set(models_source_files
   src/binsrv/models/binlog_file_record_fwd.hpp
   src/binsrv/models/binlog_file_record.hpp
 
+  src/binsrv/models/binlog_file_encryption_record_fwd.hpp
+  src/binsrv/models/binlog_file_encryption_record.hpp
+
   src/binsrv/models/error_response_fwd.hpp
   src/binsrv/models/error_response.hpp
   src/binsrv/models/error_response.cpp
+
+  src/binsrv/models/file_data_envelope_record_fwd.hpp
+  src/binsrv/models/file_data_envelope_record.hpp
+
+  src/binsrv/models/file_key_envelope_record_fwd.hpp
+  src/binsrv/models/file_key_envelope_record.hpp
 
   src/binsrv/models/response_status_type_fwd.hpp
   src/binsrv/models/response_status_type.hpp
@@ -481,6 +527,10 @@ set(binsrv_source_files
   src/binsrv/basic_logger.hpp
   src/binsrv/basic_logger.cpp
 
+  src/binsrv/basic_keyring_fwd.hpp
+  src/binsrv/basic_keyring.hpp
+  src/binsrv/basic_keyring.cpp
+
   src/binsrv/basic_storage_backend_fwd.hpp
   src/binsrv/basic_storage_backend.hpp
   src/binsrv/basic_storage_backend.cpp
@@ -492,8 +542,18 @@ set(binsrv_source_files
   src/binsrv/cout_logger.hpp
   src/binsrv/cout_logger.cpp
 
+  src/binsrv/encryption_config_fwd.hpp
+  src/binsrv/encryption_config.hpp
+  src/binsrv/encryption_config.cpp
+
+  src/binsrv/encryption_format_type_fwd.hpp
+  src/binsrv/encryption_format_type.hpp
+
   src/binsrv/exception_handling_helpers.hpp
   src/binsrv/exception_handling_helpers.cpp
+
+  src/binsrv/file_keyring.hpp
+  src/binsrv/file_keyring.cpp
 
   src/binsrv/file_logger.hpp
   src/binsrv/file_logger.cpp
@@ -509,6 +569,20 @@ set(binsrv_source_files
 
   src/binsrv/logger_factory.hpp
   src/binsrv/logger_factory.cpp
+
+  src/binsrv/keyring_config_fwd.hpp
+  src/binsrv/keyring_config.hpp
+
+  src/binsrv/keyring_factory.hpp
+  src/binsrv/keyring_factory.cpp
+
+  src/binsrv/keyring_record_collection_fwd.hpp
+  src/binsrv/keyring_record_collection.hpp
+  src/binsrv/keyring_record_collection.cpp
+
+  src/binsrv/keyring_record_fwd.hpp
+  src/binsrv/keyring_record.hpp
+  src/binsrv/keyring_record.cpp
 
   src/binsrv/main_config_fwd.hpp
   src/binsrv/main_config.hpp
@@ -569,6 +643,7 @@ target_link_libraries(binlog_server
     binsrv::lib_gtids
     binsrv::lib_events
     binsrv::lib_models
+    binsrv::lib_opensslpp
     Boost::headers Boost::json Boost::url
     aws-cpp-sdk-s3-crt
 )

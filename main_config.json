@@ -36,11 +36,19 @@
       "file_size": "128M"
     }
   },
+  "keyring": {
+    "uri": "file:///home/user/keyring/keyring/keyring_data.json"
+  },
   "storage": {
     "backend": "file",
     "uri": "file:///home/user/vault",
     "fs_buffer_directory": "/tmp/binsrv",
     "checkpoint_size": "2M",
-    "checkpoint_interval": "30s"
+    "checkpoint_interval": "30s",
+    "encryption": {
+      "format": "generic",
+      "kek_id": "alpha",
+      "cipher": "AES-256-CTR"
+    }
   }
 }

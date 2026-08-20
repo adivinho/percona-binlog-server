@@ -49,12 +49,16 @@ generic_operation<mode_type::search_by_gtid_set>::execute() const {
     binsrv::gtids::gtid_set remaining_gtids{get_gtid_set()};
 
     const binsrv::main_config config{get_config_file_path()};
+    const auto &keyring_config = config.root().get<"keyring">();
     const auto &storage_config = config.root().get<"storage">();
     const auto &replication_config = config.root().get<"replication">();
     const auto replication_mode{replication_config.get<"mode">()};
 
     const binsrv::storage storage{
-        storage_config, binsrv::storage_construction_mode_type::querying_only,
+        {},
+        keyring_config,
+        storage_config,
+        binsrv::storage_construction_mode_type::querying_only,
         replication_mode};
 
     const auto &binlog_records{storage.get_binlog_records()};

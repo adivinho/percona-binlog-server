@@ -30,6 +30,9 @@
 #include <boost/lexical_cast.hpp>
 
 #include "binsrv/basic_logger.hpp"
+#include "binsrv/encryption_config.hpp"
+#include "binsrv/encryption_format_type.hpp" // IWYU pragma: keep
+#include "binsrv/keyring_config.hpp"
 #include "binsrv/log_severity.hpp"
 #include "binsrv/replication_config.hpp"
 #include "binsrv/replication_mode_type.hpp"
@@ -162,6 +165,22 @@ void log_replication_config_info(
   }
 }
 
+void log_keyring_config_info(binsrv::basic_logger &logger,
+                             const binsrv::keyring_config &keyring_config) {
+  log_config_param<"uri">(logger, keyring_config, "keyring URI");
+}
+
+void log_encryption_config_info(
+    binsrv::basic_logger &logger,
+    const binsrv::encryption_config &encryption_config) {
+  log_config_param<"format">(logger, encryption_config,
+                             "binlog storage encryption format");
+  log_config_param<"kek_id">(logger, encryption_config,
+                             "binlog storage encryption KEK identifier");
+  log_config_param<"cipher">(logger, encryption_config,
+                             "binlog storage encryption data cipher");
+}
+
 void log_storage_config_info(binsrv::basic_logger &logger,
                              const binsrv::storage_config &storage_config) {
 
@@ -177,6 +196,10 @@ void log_storage_config_info(binsrv::basic_logger &logger,
       logger, storage_config, "binlog storage backend checkpointing size");
   log_config_param<"checkpoint_interval">(
       logger, storage_config, "binlog storage backend checkpointing interval");
+  const auto &optional_encryption_config{storage_config.get<"encryption">()};
+  if (optional_encryption_config.has_value()) {
+    log_encryption_config_info(logger, *optional_encryption_config);
+  }
 }
 
 void log_storage_info(binsrv::basic_logger &logger,
@@ -201,6 +224,13 @@ void log_storage_info(binsrv::basic_logger &logger,
     msg += std::to_string(storage.get_current_position());
   }
   logger.log(binsrv::log_severity::info, msg);
+  logger.log(binsrv::log_severity::info,
+             "storage keyring status: " + storage.get_keyring_description());
+  logger.log(binsrv::log_severity::info,
+             "storage active KEK: " + storage.get_active_kek_description());
+  logger.log(binsrv::log_severity::info,
+             "storage encryption format: " +
+                 storage.get_encryption_format_description());
 }
 
 void log_library_info(binsrv::basic_logger &logger,
